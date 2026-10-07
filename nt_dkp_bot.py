@@ -256,5 +256,66 @@ def main():
     # 6. Запуск цикла опроса обновлений (Polling)
     app.run_polling()
 
+# ... существующие функции init_db, add_application и т.д. ...
+
+def init_db():
+    conn = sqlite3.connect('clan.db')
+    cursor = conn.cursor()
+    
+    # ... старые таблицы applications и members ...
+    
+    # НОВАЯ ТАБЛИЦА: Баллы игроков
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS points (
+            tg_id INTEGER PRIMARY KEY,
+            nickname TEXT,
+            total_points INTEGER DEFAULT 0
+        )
+    ''')
+    
+    # НОВАЯ ТАБЛИЦА: История событий
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS event_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            event_type TEXT, -- Например: "Raid", "War", "Farm"
+            participants_count INTEGER,
+            admin_tg_id INTEGER, -- Кто загрузил скрин
+            details TEXT -- JSON со списком никнеймов и начисленных баллов
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
+
+def update_player_points(tg_id, nickname, points_to_add):
+    """Начисляет очки игроку"""
+    conn = sqlite3.connect('clan.db')
+    cursor = conn.cursor()
+    
+    # Проверяем, есть ли игрок в таблице points
+    cursor.execute("SELECT total_points FROM points WHERE tg_id = ?", (tg_id,))
+    row = cursor.fetchone()
+    
+    if row:
+        new_total = row[0] + points_to_add
+        cursor.execute("UPDATE points SET total_points = ? WHERE tg_id = ?", (new_total, tg_id))
+    else:
+        cursor.execute("INSERT INTO points (tg_id, nickname, total_points) VALUES (?, ?, ?)", 
+                       (tg_id, nickname, points_to_add))
+    
+    conn.commit()
+    conn.close()
+
+def save_event_log(event_type, count, admin_id, details_json):
+    """Сохраняет запись о событии"""
+    conn = sqlite3.connect('clan.db')
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO event_history (event_type, participants_count, admin_tg_id, details)
+        VALUES (?, ?, ?, ?)
+    """, (event_type, count, admin_id, details_json))
+    conn.commit()
+    conn.close()
 if __name__ == '__main__':
     main()
