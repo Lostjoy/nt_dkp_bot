@@ -1,118 +1,12 @@
 import logging
 import sqlite3
 import os
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler
-
-import requests
 import json
 import re
+import requests
 
-# Настройки API OCR (бесплатный ключ можно получить на ocr.space)
-OCR_API_KEY = "YOUR_OCR_SPACE_API_KEY" # Зарегистрируйтесь на ocr.space, получите ключ
-OCR_URL = "https://api.ocr.space/parse/image"
-
-async def handle_activity_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает загруженное фото активности"""
-    
-    # 1. Проверка прав (только админ может грузить отчеты)
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("❌ Доступ запрещен. Только администратор.")
-        return
-
-    photo = update.message.photo[-1] # Берем самое высокое разрешение
-    file_obj = await context.bot.get_file(photo.file_id)
-    
-    await update.message.reply_text("📸 Получено фото. Распознаю текст...")
-
-    try:
-        # 2. Скачиваем фото во временный буфер или читаем URL напрямую (если возможно)
-        # Для простоты скачаем байты и отправим multipart/form-data
-        img_bytes = await file_obj.download_as_bytearray()
-        
-        files = {'file': ('image.jpg', bytes(img_bytes), 'image/jpeg')}
-        payload = {
-            'apikey': OCR_API_KEY,
-            'language': 'eng', # Или 'rus' если ники кириллицей
-            'isOverlayRequired': False,
-        }
-        
-        response = requests.post(OCR_URL, files=files, data=payload)
-        result = response.json()
-        
-        if not result.get('IsErroredOnProcessing'):
-            text_found = result['ParsedResults'][0]['ParsedText']
-            
-            # 3. Парсим ники из текста
-            # Предполагаем, что ники состоят из букв/цифр/_/.
-            # Регулярка зависит от формата скриншота вашей игры!
-            found_nicknames = re.findall(r'\b[A-Za-z0-9_\.]+\b', text_found)
-            
-            # Удаляем мусор (слова типа "Level", "HP", цифры слишком короткие)
-            valid_nicks = []
-            for nick in found_nicknames:
-                if len(nick) > 2 and nick.lower() not in ['level', 'hp', 'mp', 'exp', 'gold']:
-                    valid_nicks.append(nick)
-            
-            # 4. Сверяем с базой участников
-            recognized_players = []
-            unknown_players = []
-            
-            conn = sqlite3.connect('clan.db')
-            cursor = conn.cursor()
-            
-            for nick in set(valid_nicks): # Убираем дубликаты
-                cursor.execute("SELECT tg_id FROM members WHERE LOWER(nickname) = ?", (nick.lower(),))
-                row = cursor.fetchone()
-                
-                if row:
-                    tg_id = row[0]
-                    recognized_players.append({'nick': nick, 'tg_id': tg_id})
-                    
-                    # НАЧИСЛЯЕМ БАЛЛЫ (например, 10 баллов за участие)
-                    POINTS_PER_EVENT = 10
-                    update_player_points(tg_id, nick, POINTS_PER_EVENT)
-                else:
-                    unknown_players.append(nick)
-            
-            conn.close()
-            
-            # 5. Логируем событие
-            details_json = json.dumps({
-                "recognized": recognized_players,
-                "unknown": unknown_players
-            })
-            save_event_log("Activity Photo", len(recognized_players), ADMIN_ID, details_json)
-            
-            # 6. Ответ админу
-            report_msg = (
-                f"✅ Обработка завершена!\n\n"
-                f"👥 Найдено участников: {len(recognized_players)}\n"
-                f"➕ Начислено баллов каждому: {POINTS_PER_EVENT}\n\n"
-            )
-            
-            if recognized_players:
-                report_msg += "Успешно найдены:\n"
-                for p in recognized_players[:5]: # Показываем первых 5
-                    report_msg += f"• {p['nick']} (+{POINTS_PER_EVENT})\n"
-                if len(recognized_players) > 5:
-                    report_msg += "...и еще {}\n".format(len(recognized_players)-5)
-            
-            if unknown_players:
-                report_msg += "\n⚠️ Не найдены в базе (проверьте опечатки):\n"
-                report_msg += ", ".join(unknown_players[:10])
-                
-            await update.message.reply_text(report_msg)
-            
-        else:
-            await update.message.reply_text("❌ Ошибка распознавания текста.")
-            
-    except Exception as e:
-        logger.error(f"Error processing photo: {e}")
-        await update.message.reply_text(f"❌ Произошла ошибка: {str(e)}")
-
-# Регистрируем обработчик в main()
-# app.add_handler(MessageHandler(filters.PHOTO, handle_activity_photo))
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler
 
 # --- НАСТРОЙКИ ЛОГИРОВАНИЯ ---
 logging.basicConfig(
@@ -122,42 +16,83 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- КОНФИГУРАЦИЯ ---
-# ВАЖНО: Замените эти значения на свои перед запуском!
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")  # <-- ПРАВИЛЬНО  # Токен от @BotFather
-ADMIN_ID = 525854881             # Ваш личный Telegram ID (число)
+# Читаем секреты из переменных окружения (настроенных в Render.com)
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+OCR_API_KEY = os.environ.get("OCR_API_KEY")  # Ключ от ocr.space
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "525854881")) # Ваш ID по умолчанию
+
+if not TOKEN:
+    raise ValueError("Ошибка: Не задана переменная TELEGRAM_BOT_TOKEN!")
+if not OCR_API_KEY:
+    logger.warning("Внимание: OCR_API_KEY не задан. Функция распознавания фото работать не будет.")
+
+# URL для OCR сервиса
+OCR_URL = "https://api.ocr.space/parse/image"
+
+# Черный список слов интерфейса ArcheAge/Games (чтобы не путать их с никами)
+BLACKLIST_WORDS = {
+    'level', 'lv', 'hp', 'mp', 'stamina', 'exp', 'gold', 'silver', 'bronze',
+    'damage', 'healing', 'kill', 'death', 'assist', 'raid', 'party', 'group',
+    'clan', 'guild', 'war', 'battle', 'score', 'time', 'min', 'sec', 'ms',
+    'ok', 'cancel', 'close', 'open', 'menu', 'chat', 'whisper', 'tell',
+    'archeage', 'trion', 'world', 'server', 'zone', 'map', 'coord', 'x', 'y', 'z',
+    'true', 'false', 'null', 'undefined'
+}
 
 # --- РАБОТА С БАЗОЙ ДАННЫХ (SQLite) ---
+
 def init_db():
-    """Создает таблицы в базе данных, если их еще нет"""
+    """Инициализация всех таблиц базы данных"""
     conn = sqlite3.connect('clan.db')
     cursor = conn.cursor()
     
-    # Таблица для входящих заявок
+    # 1. Заявки на вступление
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS applications (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             tg_id INTEGER,
             nickname TEXT,
             game_level TEXT,
-            status TEXT DEFAULT 'pending' -- pending, approved, rejected
+            status TEXT DEFAULT 'pending'
         )
     ''')
     
-    # Таблица для принятых участников
+    # 2. Участники клана
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS members (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             tg_id INTEGER UNIQUE,
             nickname TEXT,
-            role TEXT DEFAULT 'member' -- member, officer, admin
+            role TEXT DEFAULT 'member'
+        )
+    ''')
+    
+    # 3. Баллы активности (НОВОЕ)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS points (
+            tg_id INTEGER PRIMARY KEY,
+            nickname TEXT,
+            total_points INTEGER DEFAULT 0
+        )
+    ''')
+    
+    # 4. История событий (НОВОЕ)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS event_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            event_type TEXT,
+            participants_count INTEGER,
+            admin_tg_id INTEGER,
+            details TEXT
         )
     ''')
     
     conn.commit()
     conn.close()
+    logger.info("База данных инициализирована.")
 
 def add_application(tg_id, nickname, game_level):
-    """Добавляет новую заявку в базу"""
     conn = sqlite3.connect('clan.db')
     cursor = conn.cursor()
     cursor.execute("INSERT INTO applications (tg_id, nickname, game_level) VALUES (?, ?, ?)", 
@@ -167,43 +102,26 @@ def add_application(tg_id, nickname, game_level):
     conn.close()
     return app_id
 
-def get_pending_applications():
-    """Получает список всех ожидающих рассмотрения заявок"""
-    conn = sqlite3.connect('clan.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, tg_id, nickname, game_level FROM applications WHERE status = 'pending'")
-    rows = cursor.fetchall()
-    conn.close()
-    return rows
-
 def approve_application(app_id):
-    """Принимает заявку: переносит игрока из applications в members"""
     conn = sqlite3.connect('clan.db')
     cursor = conn.cursor()
     
-    # Получаем данные заявки
     cursor.execute("SELECT tg_id, nickname FROM applications WHERE id = ?", (app_id,))
     row = cursor.fetchone()
     
     if row:
         tg_id, nickname = row
         try:
-            # Добавляем в участники
             cursor.execute("INSERT INTO members (tg_id, nickname) VALUES (?, ?)", (tg_id, nickname))
-            # Меняем статус заявки на 'approved'
             cursor.execute("UPDATE applications SET status = 'approved' WHERE id = ?", (app_id,))
             conn.commit()
-            logger.info(f"Player {nickname} ({tg_id}) approved.")
             return True
         except sqlite3.IntegrityError:
-            # Если игрок уже есть в базе (UNIQUE constraint failed)
-            logger.warning(f"User {tg_id} already in members.")
             return False
     conn.close()
     return False
 
 def reject_application(app_id):
-    """Отклоняет заявку"""
     conn = sqlite3.connect('clan.db')
     cursor = conn.cursor()
     cursor.execute("UPDATE applications SET status = 'rejected' WHERE id = ?", (app_id,))
@@ -211,7 +129,6 @@ def reject_application(app_id):
     conn.close()
 
 def get_all_members():
-    """Возвращает список всех активных участников"""
     conn = sqlite3.connect('clan.db')
     cursor = conn.cursor()
     cursor.execute("SELECT nickname, role FROM members")
@@ -219,191 +136,11 @@ def get_all_members():
     conn.close()
     return rows
 
-# --- КОМАНДЫ БОТА ---
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /start — Приветствие и меню"""
-    user_name = update.effective_user.first_name
-    await update.message.reply_text(
-        f"Привет, {user_name}! 👋\n\n"
-        "Это официальный бот нашего клана.\n\n"
-        "Что я умею:\n"
-        "/apply - Подать заявку на вступление\n"
-        "/members - Список участников клана\n"
-        "/rules - Правила клана\n\n"
-        "Жду тебя в наших рядах!"
-    )
-
-async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /rules — Показывает правила"""
-    text = (
-        "📜 *Правила Клана*\n\n"
-        "1. Активность обязательна (минимум 5 часов в неделю).\n"
-        "2. Уважение к другим участникам.\n"
-        "3. Не спамить в общем чате.\n"
-        "4. Выполнять задания лидера.\n\n"
-        "Нарушение правил ведет к исключению."
-    )
-    await update.message.reply_text(text, parse_mode="Markdown")
-
-async def apply_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /apply — Начало процесса подачи заявки"""
-    await update.message.reply_text(
-        "Отлично! Чтобы подать заявку, отправь мне сообщение в формате:\n\n"
-        "`Ник в игре | Уровень`\n\n"
-        "Например: `DragonSlayer | 50`\n\n"
-        "(Бот распознает эту команду автоматически)"
-    )
-    # Ставим флажок, что ждем текст заявки от этого пользователя
-    context.user_data['awaiting_apply'] = True
-
-async def handle_apply_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка обычного текстового сообщения (заявки)"""
-    # Проверяем, ждет ли бот именно заявку от этого юзера
-    if not context.user_data.get('awaiting_apply'):
-        return
-        
-    text = update.message.text
-    parts = text.split('|')
-    
-    if len(parts) != 2:
-        await update.message.reply_text("❌ Формат неверный. Используй: Ник | Уровень")
-        return
-        
-    nickname = parts[0].strip()
-    level = parts[1].strip()
-    tg_id = update.effective_user.id
-    
-    # Сохраняем в БД
-    app_id = add_application(tg_id, nickname, level)
-    
-    await update.message.reply_text(
-        f"✅ Заявка принята!\n"
-        f"Ник: {nickname}\n"
-        f"ID заявки: {app_id}\n\n"
-        "Администрация рассмотрит её в ближайшее время."
-    )
-    
-    # Снимаем флажок ожидания
-    del context.user_data['awaiting_apply']
-    
-    # Отправляем уведомление Админу с кнопками
-    keyboard = [
-        [
-            InlineKeyboardButton("✅ Принять", callback_data=f"approve_{app_id}"),
-            InlineKeyboardButton("❌ Отклонить", callback_data=f"reject_{app_id}")
-        ]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    try:
-        await context.bot.send_message(
-            chat_id=ADMIN_ID,
-            text=f"🔔 Новая заявка!\nНик: {nickname}, Ур.: {level}",
-            reply_markup=reply_markup
-        )
-    except Exception as e:
-        logger.error(f"Failed to notify admin: {e}")
-
-async def members_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /members — Список участников"""
-    members = get_all_members()
-    if not members:
-        await update.message.reply_text("Клан пока пуст. Стань первым!")
-        return
-        
-    text = "👥 *Участники клана:* \n\n"
-    for nick, role in members:
-        icon = "🛡️" if role == "admin" else ("⚔️" if role == "officer" else "🧍")
-        text += f"{icon} {nick}\n"
-        
-    await update.message.reply_text(text, parse_mode="Markdown")
-
-# --- ОБРАБОТКА КНОПОК ДЛЯ АДМИНА ---
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает нажатия на кнопки Принять/Отклонить"""
-    query = update.callback_query
-    await query.answer() # Гасим кружочек загрузки в Telegram
-    
-    data = query.data
-    
-    if data.startswith("approve_"):
-        app_id = int(data.split("_")[1])
-        success = approve_application(app_id)
-        if success:
-            await query.edit_message_text("✅ Игрок добавлен в клан!")
-        else:
-            await query.edit_message_text("⚠️ Ошибка или игрок уже в базе.")
-            
-    elif data.startswith("reject_"):
-        app_id = int(data.split("_")[1])
-        reject_application(app_id)
-        await query.edit_message_text("❌ Заявка отклонена.")
-
-# --- ГЛАВНАЯ ФУНКЦИЯ ЗАПУСКА ---
-def main():
-    # 1. Инициализация базы данных при старте
-    init_db()
-    
-    # 2. Создание приложения
-    app = ApplicationBuilder().token(TOKEN).build()
-
-    # 3. Регистрация обработчиков команд
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("rules", rules))
-    app.add_handler(CommandHandler("apply", apply_command))
-    app.add_handler(CommandHandler("members", members_list))
-    
-    # 4. Обработчик текста (для приема заявок)
-    # Фильтр фильтрует только текст, но не команды (начинающиеся с /)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_apply_message))
-    
-    # 5. Обработчик нажатий на кнопки (Callback Query)
-    app.add_handler(CallbackQueryHandler(button_callback))
-
-    print("Клан-бот запущен... Нажмите Ctrl+C для остановки.")
-    
-    # 6. Запуск цикла опроса обновлений (Polling)
-    app.run_polling()
-
-# ... существующие функции init_db, add_application и т.д. ...
-
-def init_db():
-    conn = sqlite3.connect('clan.db')
-    cursor = conn.cursor()
-    
-    # ... старые таблицы applications и members ...
-    
-    # НОВАЯ ТАБЛИЦА: Баллы игроков
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS points (
-            tg_id INTEGER PRIMARY KEY,
-            nickname TEXT,
-            total_points INTEGER DEFAULT 0
-        )
-    ''')
-    
-    # НОВАЯ ТАБЛИЦА: История событий
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS event_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            event_type TEXT, -- Например: "Raid", "War", "Farm"
-            participants_count INTEGER,
-            admin_tg_id INTEGER, -- Кто загрузил скрин
-            details TEXT -- JSON со списком никнеймов и начисленных баллов
-        )
-    ''')
-    
-    conn.commit()
-    conn.close()
-
 def update_player_points(tg_id, nickname, points_to_add):
     """Начисляет очки игроку"""
     conn = sqlite3.connect('clan.db')
     cursor = conn.cursor()
     
-    # Проверяем, есть ли игрок в таблице points
     cursor.execute("SELECT total_points FROM points WHERE tg_id = ?", (tg_id,))
     row = cursor.fetchone()
     
@@ -427,5 +164,288 @@ def save_event_log(event_type, count, admin_id, details_json):
     """, (event_type, count, admin_id, details_json))
     conn.commit()
     conn.close()
+
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ OCR ---
+
+def is_valid_arche_nickname(nick):
+    """Проверяет, похож ли строковый фрагмент на ник игрока"""
+    if not nick or len(nick) < 2 or len(nick) > 16:
+        return False
+    
+    clean_nick = nick.strip()
+    
+    # Отсеиваем чисто цифровые строки
+    if clean_nick.isdigit():
+        return False
+        
+    # Отсеиваем слова из черного списка
+    if clean_nick.lower() in BLACKLIST_WORDS:
+        return False
+        
+    # Разрешаем: Буквы (лат/рус), цифры, _ . - ' 
+    pattern = r'^[a-zA-Zа-яА-ЯёЁ0-9_\.\-\']+$'
+    if not re.match(pattern, clean_nick):
+        return False
+        
+    return True
+
+# --- КОМАНДЫ БОТА ---
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_name = update.effective_user.first_name
+    await update.message.reply_text(
+        f"Привет, {user_name}! 👋\n\n"
+        "Это официальный бот нашего клана ArcheAge.\n\n"
+        "Что я умею:\n"
+        "/apply - Подать заявку на вступление\n"
+        "/members - Список участников клана\n"
+        "/rules - Правила клана\n"
+        "/top - Рейтинг игроков по баллам\n\n"
+        "📸 *Админам:* Просто пришлите скриншот рейда/воя, чтобы начислить баллы!"
+    )
+
+async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "📜 *Правила Клана*\n\n"
+        "1. Активность обязательна (минимум 5 часов в неделю).\n"
+        "2. Уважение к другим участникам.\n"
+        "3. Не спамить в общем чате.\n"
+        "4. Выполнять задания лидера.\n\n"
+        "Нарушение правил ведет к исключению."
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+async def apply_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Отлично! Чтобы подать заявку, отправь мне сообщение в формате:\n\n"
+        "`Ник в игре | Уровень`\n\n"
+        "Например: `DragonSlayer | 50`"
+    )
+    context.user_data['awaiting_apply'] = True
+
+async def handle_apply_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get('awaiting_apply'):
+        return
+        
+    text = update.message.text
+    parts = text.split('|')
+    
+    if len(parts) != 2:
+        await update.message.reply_text("❌ Формат неверный. Используй: Ник | Уровень")
+        return
+        
+    nickname = parts[0].strip()
+    level = parts[1].strip()
+    tg_id = update.effective_user.id
+    
+    app_id = add_application(tg_id, nickname, level)
+    
+    await update.message.reply_text(f"✅ Заявка принята!\nID заявки: {app_id}")
+    del context.user_data['awaiting_apply']
+    
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Принять", callback_data=f"approve_{app_id}"),
+            InlineKeyboardButton("❌ Отклонить", callback_data=f"reject_{app_id}")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"🔔 Новая заявка!\nНик: {nickname}, Ур.: {level}",
+            reply_markup=reply_markup
+        )
+    except Exception as e:
+        logger.error(f"Failed to notify admin: {e}")
+
+async def members_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    members = get_all_members()
+    if not members:
+        await update.message.reply_text("Клан пока пуст. Стань первым!")
+        return
+        
+    text = "👥 *Участники клана:* \n\n"
+    for nick, role in members:
+        icon = "🛡️" if role == "admin" else ("⚔️" if role == "officer" else "🧍")
+        text += f"{icon} {nick}\n"
+        
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+async def top_players(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает рейтинг игроков по баллам"""
+    conn = sqlite3.connect('clan.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT nickname, total_points FROM points ORDER BY total_points DESC LIMIT 10")
+    rows = cursor.fetchall()
+    conn.close()
+    
+    if not rows:
+        await update.message.reply_text("Баллов пока нет. Участвуйте в ивентах!")
+        return
+        
+    text = "🏆 *Топ игроков клана:* \n\n"
+    medals = ["🥇", "", "🥉"]
+    for i, (nick, pts) in enumerate(rows):
+        medal = medals[i] if i < 3 else f"{i+1}."
+        text += f"{medal} {nick}: {pts} баллов\n"
+        
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+# --- ОБРАБОТКА ФОТО АКТИВНОСТИ (OCR) ---
+
+async def handle_activity_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает загруженное фото активности"""
+    
+    # 1. Проверка прав
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ Доступ запрещен. Только администратор.")
+        return
+
+    if not OCR_API_KEY:
+        await update.message.reply_text("⚠️ Ошибка: API ключ OCR не настроен. Обратитесь к владельцу сервера.")
+        return
+
+    photo = update.message.photo[-1]
+    file_obj = await context.bot.get_file(photo.file_id)
+    
+    msg_status = await update.message.reply_text("📸 Получено фото. Распознаю текст...")
+
+    try:
+        img_bytes = await file_obj.download_as_bytearray()
+        
+        files = {'file': ('image.jpg', bytes(img_bytes), 'image/jpeg')}
+        payload = {
+            'apikey': OCR_API_KEY,
+            'language': 'eng+rus', # Поддержка английских и русских ников
+            'isOverlayRequired': False,
+            'scale': True,
+            'detectOrientation': True,
+            'ocrEngineMode': 0 
+        }
+        
+        response = requests.post(OCR_URL, files=files, data=payload)
+        result = response.json()
+        
+        if result.get('IsErroredOnProcessing'):
+            await msg_status.edit_text("❌ Ошибка распознавания текста сервисом.")
+            return
+
+        raw_text = result['ParsedResults'][0]['ParsedText']
+        
+        # Извлекаем потенциальные кандидаты в ники
+        candidates = re.findall(r'\S+', raw_text)
+        
+        valid_nicks = []
+        seen_in_this_scan = set()
+        
+        for cand in candidates:
+            cleaned = cand.strip('.,;:!?"\'()[]{}')
+            
+            if is_valid_arche_nickname(cleaned) and cleaned not in seen_in_this_scan:
+                valid_nicks.append(cleaned)
+                seen_in_this_scan.add(cleaned)
+        
+        # Сверяем с базой участников
+        recognized_players = []
+        unknown_candidates = []
+        
+        conn = sqlite3.connect('clan.db')
+        cursor = conn.cursor()
+        
+        POINTS_PER_RAID = 50 # Количество баллов за событие
+        
+        for nick in valid_nicks:
+            cursor.execute("SELECT tg_id FROM members WHERE LOWER(nickname) = ?", (nick.lower(),))
+            row = cursor.fetchone()
+            
+            if row:
+                tg_id = row[0]
+                recognized_players.append({'nick': nick, 'tg_id': tg_id})
+                update_player_points(tg_id, nick, POINTS_PER_RAID)
+            else:
+                if len(nick) > 3: # Игнорируем короткие мусорные обрывки
+                     unknown_candidates.append(nick)
+                     
+        conn.close()
+        
+        # Формируем отчет
+        report_msg = (
+            f"✅ Обработка завершена!\n\n"
+            f"👥 Найдено участников: {len(recognized_players)}\n"
+            f"💰 Начислено баллов каждому: {POINTS_PER_RAID}\n\n"
+        )
+        
+        if recognized_players:
+            report_msg += "**Успешно найдены:**\n"
+            for p in recognized_players[:10]:
+                report_msg += f"• `{p['nick']}` (+{POINTS_PER_RAID})\n"
+            if len(recognized_players) > 10:
+                report_msg += f"...и еще {len(recognized_players)-10}\n"
+                
+        if unknown_candidates:
+            report_msg += "\n⚠️ **Не найдено в базе (проверьте опечатки):**\n"
+            report_msg += ", ".join([f"`{n}`" for n in unknown_candidates[:5]])
+            if len(unknown_candidates) > 5:
+                report_msg += f"\n...и еще {len(unknown_candidates)-5}"
+                
+        # Сохраняем историю
+        save_event_log("ArcheAge Activity Photo", len(recognized_players), ADMIN_ID, json.dumps({
+            "found": [p['nick'] for p in recognized_players],
+            "misses": unknown_candidates
+        }))
+
+        await msg_status.edit_text(report_msg, parse_mode="Markdown")
+
+    except Exception as e:
+        logger.error(f"Photo processing error: {e}")
+        await msg_status.edit_text(f"❌ Произошла ошибка: {str(e)}")
+
+# --- ОБРАБОТКА КНОПОК ДЛЯ АДМИНА ---
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data
+    
+    if data.startswith("approve_"):
+        app_id = int(data.split("_")[1])
+        success = approve_application(app_id)
+        if success:
+            await query.edit_message_text("✅ Игрок добавлен в клан!")
+        else:
+            await query.edit_message_text("⚠️ Ошибка или игрок уже в базе.")
+            
+    elif data.startswith("reject_"):
+        app_id = int(data.split("_")[1])
+        reject_application(app_id)
+        await query.edit_message_text("❌ Заявка отклонена.")
+
+# --- ГЛАВНАЯ ФУНКЦИЯ ЗАПУСКА ---
+def main():
+    init_db()
+    
+    app = ApplicationBuilder().token(TOKEN).build()
+
+    # Команды
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("rules", rules))
+    app.add_handler(CommandHandler("apply", apply_command))
+    app.add_handler(CommandHandler("members", members_list))
+    app.add_handler(CommandHandler("top", top_players))
+    
+    # Текст (заявки)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_apply_message))
+    
+    # Фото (активность) - РАСКОММЕНТИРОВАННЫЙ ОБРАБОТЧИК
+    app.add_handler(MessageHandler(filters.PHOTO, handle_activity_photo))
+    
+    # Кнопки
+    app.add_handler(CallbackQueryHandler(button_callback))
+
+    print("Клан-бот запущен... Нажмите Ctrl+C для остановки.")
+    app.run_polling()
+
 if __name__ == '__main__':
     main()
