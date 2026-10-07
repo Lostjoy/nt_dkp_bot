@@ -13,8 +13,7 @@ logger = logging.getLogger(__name__)
 
 # --- КОНФИГУРАЦИЯ ---
 # ВАЖНО: Замените эти значения на свои перед запуском!
-TOKEN = os.environ.get
-("8861486783:AAGwLhLTyjXlD_e73kJ-xg49-WXNYhyKuAw")  # Токен от @BotFather
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")  # <-- ПРАВИЛЬНО  # Токен от @BotFather
 ADMIN_ID = 525854881             # Ваш личный Telegram ID (число)
 
 # --- РАБОТА С БАЗОЙ ДАННЫХ (SQLite) ---
