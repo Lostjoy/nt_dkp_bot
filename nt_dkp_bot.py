@@ -4,6 +4,116 @@ import os
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler
 
+import requests
+import json
+import re
+
+# Настройки API OCR (бесплатный ключ можно получить на ocr.space)
+OCR_API_KEY = "YOUR_OCR_SPACE_API_KEY" # Зарегистрируйтесь на ocr.space, получите ключ
+OCR_URL = "https://api.ocr.space/parse/image"
+
+async def handle_activity_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает загруженное фото активности"""
+    
+    # 1. Проверка прав (только админ может грузить отчеты)
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ Доступ запрещен. Только администратор.")
+        return
+
+    photo = update.message.photo[-1] # Берем самое высокое разрешение
+    file_obj = await context.bot.get_file(photo.file_id)
+    
+    await update.message.reply_text("📸 Получено фото. Распознаю текст...")
+
+    try:
+        # 2. Скачиваем фото во временный буфер или читаем URL напрямую (если возможно)
+        # Для простоты скачаем байты и отправим multipart/form-data
+        img_bytes = await file_obj.download_as_bytearray()
+        
+        files = {'file': ('image.jpg', bytes(img_bytes), 'image/jpeg')}
+        payload = {
+            'apikey': OCR_API_KEY,
+            'language': 'eng', # Или 'rus' если ники кириллицей
+            'isOverlayRequired': False,
+        }
+        
+        response = requests.post(OCR_URL, files=files, data=payload)
+        result = response.json()
+        
+        if not result.get('IsErroredOnProcessing'):
+            text_found = result['ParsedResults'][0]['ParsedText']
+            
+            # 3. Парсим ники из текста
+            # Предполагаем, что ники состоят из букв/цифр/_/.
+            # Регулярка зависит от формата скриншота вашей игры!
+            found_nicknames = re.findall(r'\b[A-Za-z0-9_\.]+\b', text_found)
+            
+            # Удаляем мусор (слова типа "Level", "HP", цифры слишком короткие)
+            valid_nicks = []
+            for nick in found_nicknames:
+                if len(nick) > 2 and nick.lower() not in ['level', 'hp', 'mp', 'exp', 'gold']:
+                    valid_nicks.append(nick)
+            
+            # 4. Сверяем с базой участников
+            recognized_players = []
+            unknown_players = []
+            
+            conn = sqlite3.connect('clan.db')
+            cursor = conn.cursor()
+            
+            for nick in set(valid_nicks): # Убираем дубликаты
+                cursor.execute("SELECT tg_id FROM members WHERE LOWER(nickname) = ?", (nick.lower(),))
+                row = cursor.fetchone()
+                
+                if row:
+                    tg_id = row[0]
+                    recognized_players.append({'nick': nick, 'tg_id': tg_id})
+                    
+                    # НАЧИСЛЯЕМ БАЛЛЫ (например, 10 баллов за участие)
+                    POINTS_PER_EVENT = 10
+                    update_player_points(tg_id, nick, POINTS_PER_EVENT)
+                else:
+                    unknown_players.append(nick)
+            
+            conn.close()
+            
+            # 5. Логируем событие
+            details_json = json.dumps({
+                "recognized": recognized_players,
+                "unknown": unknown_players
+            })
+            save_event_log("Activity Photo", len(recognized_players), ADMIN_ID, details_json)
+            
+            # 6. Ответ админу
+            report_msg = (
+                f"✅ Обработка завершена!\n\n"
+                f"👥 Найдено участников: {len(recognized_players)}\n"
+                f"➕ Начислено баллов каждому: {POINTS_PER_EVENT}\n\n"
+            )
+            
+            if recognized_players:
+                report_msg += "Успешно найдены:\n"
+                for p in recognized_players[:5]: # Показываем первых 5
+                    report_msg += f"• {p['nick']} (+{POINTS_PER_EVENT})\n"
+                if len(recognized_players) > 5:
+                    report_msg += "...и еще {}\n".format(len(recognized_players)-5)
+            
+            if unknown_players:
+                report_msg += "\n⚠️ Не найдены в базе (проверьте опечатки):\n"
+                report_msg += ", ".join(unknown_players[:10])
+                
+            await update.message.reply_text(report_msg)
+            
+        else:
+            await update.message.reply_text("❌ Ошибка распознавания текста.")
+            
+    except Exception as e:
+        logger.error(f"Error processing photo: {e}")
+        await update.message.reply_text(f"❌ Произошла ошибка: {str(e)}")
+
+# Регистрируем обработчик в main()
+# app.add_handler(MessageHandler(filters.PHOTO, handle_activity_photo))
+
 # --- НАСТРОЙКИ ЛОГИРОВАНИЯ ---
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
