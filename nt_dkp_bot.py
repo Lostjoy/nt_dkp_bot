@@ -3,11 +3,7 @@ import sqlite3
 import os
 import json
 import re
-import io
-
-import easyocr
-import numpy as np
-from PIL import Image
+import requests # Для запросов к ocr.space
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler
@@ -21,10 +17,16 @@ logger = logging.getLogger(__name__)
 
 # --- КОНФИГУРАЦИЯ ---
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+OCR_API_KEY = os.environ.get("OCR_API_KEY") # Ключ от ocr.space
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "525854881"))
 
 if not TOKEN:
     raise ValueError("Ошибка: Не задана переменная TELEGRAM_BOT_TOKEN!")
+if not OCR_API_KEY:
+    logger.warning("Внимание: OCR_API_KEY не задан. Фото-распознавание работать не будет.")
+
+# URL для OCR сервиса
+OCR_URL = "https://api.ocr.space/parse/image"
 
 # Черный список слов интерфейса ArcheAge/Games
 BLACKLIST_WORDS = {
@@ -36,17 +38,6 @@ BLACKLIST_WORDS = {
     'true', 'false', 'null', 'undefined'
 }
 
-# --- ИНИЦИАЛИЗАЦИЯ EASYOCR (ОДИН РАЗ ПРИ СТАРТЕ) ---
-# Важно: делаем это ПОСЛЕ объявления logger
-try:
-    logger.info("⏳ Загрузка моделей EasyOCR...")
-    ocr_reader = easyocr.Reader(['ru', 'en'], gpu=False)
-    logger.info("✅ EasyOCR модели загружены успешно.")
-except Exception as e:
-    logger.error(f"❌ Ошибка загрузки EasyOCR: {e}")
-    ocr_reader = None
-
-
 # --- РАБОТА С БАЗОЙ ДАННЫХ (SQLite) ---
 
 def init_db():
@@ -54,15 +45,19 @@ def init_db():
     conn = sqlite3.connect('clan.db')
     cursor = conn.cursor()
     
+    # 1. Заявки на вступление
     cursor.execute('''CREATE TABLE IF NOT EXISTS applications (
         id INTEGER PRIMARY KEY AUTOINCREMENT, tg_id INTEGER, nickname TEXT, game_level TEXT, status TEXT DEFAULT 'pending')''')
     
+    # 2. Участники клана
     cursor.execute('''CREATE TABLE IF NOT EXISTS members (
         id INTEGER PRIMARY KEY AUTOINCREMENT, tg_id INTEGER UNIQUE, nickname TEXT, role TEXT DEFAULT 'member')''')
     
+    # 3. Баллы активности
     cursor.execute('''CREATE TABLE IF NOT EXISTS points (
         tg_id INTEGER PRIMARY KEY, nickname TEXT, total_points INTEGER DEFAULT 0)''')
     
+    # 4. История событий
     cursor.execute('''CREATE TABLE IF NOT EXISTS event_history (
         id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
         event_type TEXT, participants_count INTEGER, admin_tg_id INTEGER, details TEXT)''')
@@ -162,7 +157,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/members - Список участников клана\n"
         "/rules - Правила клана\n"
         "/top - Рейтинг игроков по баллам\n\n"
-        "📸 *Админам:* Просто пришлите скриншот рейда/воя, чтобы начислить баллы!"
+        "📸 *Админам:*\n"
+        "/raid Ник1, Ник2 - Начислить баллы вручную\n"
+        "Или пришлите скриншот рейда/воя!"
     )
 
 async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -230,70 +227,158 @@ async def top_players(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
-# --- ОБРАБОТКА ФОТО АКТИВНОСТИ (EASYOCR) ---
-# ЕДИНСТВЕННАЯ ВЕРСИЯ ФУНКЦИИ
+# --- РУЧНОЙ ВВОД РЕЙДА (/raid) ---
 
-async def handle_activity_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает фото активности через EasyOCR"""
+async def raid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ручной ввод участников рейда через запятую"""
     
     if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("❌ Доступ запрещен.")
+        await update.message.reply_text("❌ Эта команда доступна только администраторам.")
+        return
+    
+    if not context.args:
+        await update.message.reply_text(
+            "ℹ️ *Как использовать:*\n\n"
+            "`/raid Ник1, Ник2, Ник3`\n\n"
+            "Пример:\n"
+            "`/raid Reedzz, Кровь, Урану, Софи`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    full_text = " ".join(context.args)
+    raw_nicks = [n.strip() for n in full_text.split(",")]
+    nicks_to_check = [n for n in raw_nicks if n]
+    
+    if not nicks_to_check:
+        await update.message.reply_text("❌ Вы не указали ни одного ника.")
+        return
+    
+    conn = sqlite3.connect('clan.db')
+    cursor = conn.cursor()
+    
+    POINTS_PER_RAID = 50
+    recognized = []
+    not_found = []
+    
+    for nick in nicks_to_check:
+        cursor.execute("SELECT tg_id FROM members WHERE LOWER(nickname) = ?", (nick.lower(),))
+        row = cursor.fetchone()
+        
+        if row:
+            tg_id = row[0]
+            update_player_points(tg_id, nick, POINTS_PER_RAID)
+            recognized.append(nick)
+        else:
+            not_found.append(nick)
+    
+    conn.close()
+    
+    total_points = len(recognized) * POINTS_PER_RAID
+    
+    report = f"✅ *Рейд обработан!*\n\n"
+    report += f"👥 Участников найдено: {len(recognized)}\n"
+    report += f"💰 Начислено баллов: {total_points}\n\n"
+    
+    if recognized:
+        report += "*Успешно:*\n"
+        for nick in recognized:
+            report += f"• `{nick}` (+{POINTS_PER_RAID})\n"
+    
+    if not_found:
+        report += "\n⚠️ *Не найдены в клане:*\n"
+        for nick in not_found:
+            report += f"• `{nick}`\n"
+        report += "\n_Проверьте правильность написания ников._"
+    
+    save_event_log(
+        "Manual Raid Input", 
+        len(recognized), 
+        ADMIN_ID, 
+        json.dumps({"found": recognized, "misses": not_found})
+    )
+    
+    await update.message.reply_text(report, parse_mode="Markdown")
+
+
+# --- ОБРАБОТКА ФОТО АКТИВНОСТИ (OCR.SPACE) ---
+
+async def handle_activity_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает загруженное фото активности через ocr.space"""
+    
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ Доступ запрещен. Только администратор.")
         return
 
-    if ocr_reader is None:
-        await update.message.reply_text("⚠️ Модуль распознавания не инициализирован. Проверьте логи сервера.")
+    if not OCR_API_KEY:
+        await update.message.reply_text("⚠️ Ошибка: API ключ OCR не настроен.")
         return
 
     photo = update.message.photo[-1]
     file_obj = await context.bot.get_file(photo.file_id)
     
-    msg_status = await update.message.reply_text("📸 Получено фото. Распознаю текст (EasyOCR)...")
+    msg_status = await update.message.reply_text("📸 Получено фото. Распознаю текст...")
 
     try:
         img_bytes = await file_obj.download_as_bytearray()
         
-        # Конвертируем байты в формат, понятный EasyOCR
-        image = Image.open(io.BytesIO(bytes(img_bytes)))
-        image_np = np.array(image)
+        files = {'file': ('image.jpg', bytes(img_bytes), 'image/jpeg')}
         
-        # Распознавание
-        results = ocr_reader.readtext(image_np, detail=1, paragraph=False)
+        payload = {
+            'apikey': OCR_API_KEY,
+            'language': 'eng+rus', 
+            'isOverlayRequired': False,
+            'scale': True,           
+            'detectOrientation': True,
+            'OCREngine': 2,          
+            'deskew': True,          
+            'brightness': -1         
+        }
         
-        if not results:
-            await msg_status.edit_text("❌ Текст не найден на изображении.")
+        response = requests.post(OCR_URL, files=files, data=payload)
+        result = response.json()
+        
+        if 'errorDetails' in result or result.get('IsErroredOnProcessing'):
+            error_msg = result.get('errorDetails', 'Неизвестная ошибка OCR')
+            logger.error(f"OCR Error Details: {result}")
+            await msg_status.edit_text(f"❌ Сервис вернул ошибку:\n{error_msg}")
             return
+
+        parsed_results = result.get('ParsedResults')
+        if not parsed_results or len(parsed_results) == 0:
+             await msg_status.edit_text("❌ Не удалось извлечь текст.\n💡 Совет: Попробуйте прислать скриншот крупнее или используйте /raid.")
+             return
+
+        text_found = parsed_results[0].get('ParsedText', '')
         
-        # Извлекаем текст с уверенностью > 0.3
-        found_texts = []
-        for bbox, text, conf in results:
-            if conf > 0.3:
-                found_texts.append(text.strip())
+        if not text_found.strip():
+            await msg_status.edit_text("❌ Текст не найден. Изображение слишком сложное.\n💡 Используйте команду /raid для ручного ввода.")
+            return
+            
+        candidates = re.findall(r'\S+', text_found)
         
-        logger.info(f"EasyOCR found {len(found_texts)} text blocks: {found_texts[:10]}")
-        
-        # Парсим ники
         valid_nicks = []
         seen_in_this_scan = set()
         
-        for text_block in found_texts:
-            candidates = re.findall(r'\S+', text_block)
-            for cand in candidates:
-                cleaned = cand.strip('.,;:!?"\'()[]{}')
-                if is_valid_arche_nickname(cleaned) and cleaned not in seen_in_this_scan:
-                    valid_nicks.append(cleaned)
-                    seen_in_this_scan.add(cleaned)
+        for cand in candidates:
+            cleaned = cand.strip('.,;:!?"\'()[]{}')
+            
+            if is_valid_arche_nickname(cleaned) and cleaned not in seen_in_this_scan:
+                valid_nicks.append(cleaned)
+                seen_in_this_scan.add(cleaned)
         
-        # Сверяем с базой
         recognized_players = []
         unknown_candidates = []
         
         conn = sqlite3.connect('clan.db')
         cursor = conn.cursor()
+        
         POINTS_PER_RAID = 50 
         
         for nick in valid_nicks:
             cursor.execute("SELECT tg_id FROM members WHERE LOWER(nickname) = ?", (nick.lower(),))
             row = cursor.fetchone()
+            
             if row:
                 tg_id = row[0]
                 recognized_players.append({'nick': nick, 'tg_id': tg_id})
@@ -301,40 +386,38 @@ async def handle_activity_photo(update: Update, context: ContextTypes.DEFAULT_TY
             else:
                 if len(nick) > 3: 
                      unknown_candidates.append(nick)
+                     
         conn.close()
         
-        # Формируем отчет
         report_msg = (
-            f"✅ Обработка завершена (EasyOCR)!\n\n"
+            f"✅ Обработка завершена!\n\n"
             f"👥 Найдено участников: {len(recognized_players)}\n"
             f"💰 Начислено баллов каждому: {POINTS_PER_RAID}\n\n"
         )
+        
         if recognized_players:
             report_msg += "**Успешно найдены:**\n"
             for p in recognized_players[:10]:
                 report_msg += f"• `{p['nick']}` (+{POINTS_PER_RAID})\n"
             if len(recognized_players) > 10:
                 report_msg += f"...и еще {len(recognized_players)-10}\n"
+                
         if unknown_candidates:
-            report_msg += "\n⚠️ **Не найдено в базе:**\n"
+            report_msg += "\n⚠️ **Не найдено в базе (проверьте опечатки):**\n"
             report_msg += ", ".join([f"`{n}`" for n in unknown_candidates[:5]])
             if len(unknown_candidates) > 5:
                 report_msg += f"\n...и еще {len(unknown_candidates)-5}"
                 
-        save_event_log("ArcheAge EasyOCR Photo", len(recognized_players), ADMIN_ID, json.dumps({
+        save_event_log("ArcheAge Activity Photo", len(recognized_players), ADMIN_ID, json.dumps({
             "found": [p['nick'] for p in recognized_players],
-            "misses": unknown_candidates,
-            "raw_ocr_count": len(found_texts)
+            "misses": unknown_candidates
         }))
 
         await msg_status.edit_text(report_msg, parse_mode="Markdown")
 
-    except MemoryError:
-        logger.error("EasyOCR ran out of memory!")
-        await msg_status.edit_text("❌ Недостаточно памяти для распознавания. Сервер перегружен.")
     except Exception as e:
-        logger.error(f"EasyOCR critical error: {e}", exc_info=True)
-        await msg_status.edit_text(f"❌ Ошибка распознавания: {str(e)}")
+        logger.error(f"Photo processing critical error: {e}")
+        await msg_status.edit_text(f"❌ Критическая ошибка бота: {str(e)}")
 
 
 # --- ОБРАБОТКА КНОПОК ДЛЯ АДМИНА ---
@@ -365,6 +448,8 @@ def main():
     app.add_handler(CommandHandler("apply", apply_command))
     app.add_handler(CommandHandler("members", members_list))
     app.add_handler(CommandHandler("top", top_players))
+    app.add_handler(CommandHandler("raid", raid_command)) # <-- НОВАЯ КОМАНДА
+    
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_apply_message))
     app.add_handler(MessageHandler(filters.PHOTO, handle_activity_photo))
     app.add_handler(CallbackQueryHandler(button_callback))
