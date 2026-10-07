@@ -294,7 +294,6 @@ async def top_players(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="Markdown")
 
 # --- ОБРАБОТКА ФОТО АКТИВНОСТИ (OCR) ---
-# ЭТА ФУНКЦИЯ ТЕПЕРЬ ЕДИНСТВЕННАЯ И ПРАВИЛЬНАЯ
 
 async def handle_activity_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обрабатывает загруженное фото активности"""
@@ -317,13 +316,19 @@ async def handle_activity_photo(update: Update, context: ContextTypes.DEFAULT_TY
         img_bytes = await file_obj.download_as_bytearray()
         
         files = {'file': ('image.jpg', bytes(img_bytes), 'image/jpeg')}
+        
+        # ИЗМЕНЕННЫЕ НАСТРОЙКИ ДЛЯ СЛОЖНЫХ СКРИНШОТОВ ARCHEAGE
         payload = {
             'apikey': OCR_API_KEY,
             'language': 'eng+rus', 
             'isOverlayRequired': False,
-            'scale': True,
+            'scale': True,           # Масштабирование вверх
             'detectOrientation': True,
-            'ocrEngineMode': 0 
+            
+            # КЛЮЧЕВЫЕ ПАРАМЕТРЫ ДЛЯ КАЧЕСТВА:
+            'OCREngine': 2,          # Используем движок Tesseract v4/v5 (лучше видит мелкий текст)
+            'deskew': True,          # Исправление наклона картинки
+            'brightness': -1         # Автокоррекция контраста/яркости (-1 = auto)
         }
         
         response = requests.post(OCR_URL, files=files, data=payload)
@@ -341,13 +346,13 @@ async def handle_activity_photo(update: Update, context: ContextTypes.DEFAULT_TY
         # Проверяем существование ParsedResults и что он не пустой
         parsed_results = result.get('ParsedResults')
         if not parsed_results or len(parsed_results) == 0:
-             await msg_status.edit_text("❌ Не удалось извлечь текст. Возможно, изображение слишком сложное или лимит запросов исчерпан.")
+             await msg_status.edit_text("❌ Не удалось извлечь текст.\n💡 Совет: Попробуйте прислать скриншот крупнее или обрезанный только по именам.")
              return
 
         text_found = parsed_results[0].get('ParsedText', '')
         
         if not text_found.strip():
-            await msg_status.edit_text("❌ Текст не найден. Попробуйте сделать скриншот крупнее или четче.")
+            await msg_status.edit_text("❌ Текст не найден. Изображение слишком сложное для распознавания.")
             return
             
         # -----------------------------------------
