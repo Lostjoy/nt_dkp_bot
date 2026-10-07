@@ -304,6 +304,128 @@ async def handle_activity_photo(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     if not OCR_API_KEY:
+        await update.message.reply_text("⚠️ Ошибка: API ключ OCR не настроен.")
+        return
+
+    photo = update.message.photo[-1]
+    file_obj = await context.bot.get_file(photo.file_id)
+    
+    msg_status = await update.message.reply_text("📸 Получено фото. Распознаю текст...")
+
+    try:
+        img_bytes = await file_obj.download_as_bytearray()
+        
+        files = {'file': ('image.jpg', bytes(img_bytes), 'image/jpeg')}
+        payload = {
+            'apikey': OCR_API_KEY,
+            'language': 'eng+rus', 
+            'isOverlayRequired': False,
+            'scale': True,
+            'detectOrientation': True,
+            'ocrEngineMode': 0 
+        }
+        
+        response = requests.post(OCR_URL, files=files, data=payload)
+        result = response.json()
+        
+        # --- НОВАЯ ЛОГИКА ПРОВЕРКИ РЕЗУЛЬТАТА ---
+        
+        # Проверяем, есть ли ошибка в самом ответе JSON
+        if 'errorDetails' in result or result.get('IsErroredOnProcessing'):
+            error_msg = result.get('errorDetails', 'Неизвестная ошибка OCR')
+            logger.error(f"OCR Error Details: {result}")
+            await msg_status.edit_text(f"❌ Сервис распознавания вернул ошибку:\n{error_msg}")
+            return
+
+        # Проверяем существование ParsedResults и что он не пустой
+        parsed_results = result.get('ParsedResults')
+        if not parsed_results or len(parsed_results) == 0:
+             await msg_status.edit_text("❌ Не удалось извлечь текст. Возможно, изображение слишком сложное или лимит запросов исчерпан.")
+             return
+
+        text_found = parsed_results[0].get('ParsedText', '')
+        
+        if not text_found.strip():
+            await msg_status.edit_text("❌ Текст не найден. Попробуйте сделать скриншот крупнее или четче.")
+            return
+            
+        # -----------------------------------------
+
+        # Извлекаем потенциальные кандидаты в ники
+        candidates = re.findall(r'\S+', text_found)
+        
+        valid_nicks = []
+        seen_in_this_scan = set()
+        
+        for cand in candidates:
+            cleaned = cand.strip('.,;:!?"\'()[]{}')
+            
+            if is_valid_arche_nickname(cleaned) and cleaned not in seen_in_this_scan:
+                valid_nicks.append(cleaned)
+                seen_in_this_scan.add(cleaned)
+        
+        # Сверяем с базой участников
+        recognized_players = []
+        unknown_candidates = []
+        
+        conn = sqlite3.connect('clan.db')
+        cursor = conn.cursor()
+        
+        POINTS_PER_RAID = 50 
+        
+        for nick in valid_nicks:
+            cursor.execute("SELECT tg_id FROM members WHERE LOWER(nickname) = ?", (nick.lower(),))
+            row = cursor.fetchone()
+            
+            if row:
+                tg_id = row[0]
+                recognized_players.append({'nick': nick, 'tg_id': tg_id})
+                update_player_points(tg_id, nick, POINTS_PER_RAID)
+            else:
+                if len(nick) > 3: 
+                     unknown_candidates.append(nick)
+                     
+        conn.close()
+        
+        # Формируем отчет
+        report_msg = (
+            f"✅ Обработка завершена!\n\n"
+            f"👥 Найдено участников: {len(recognized_players)}\n"
+            f"💰 Начислено баллов каждому: {POINTS_PER_RAID}\n\n"
+        )
+        
+        if recognized_players:
+            report_msg += "**Успешно найдены:**\n"
+            for p in recognized_players[:10]:
+                report_msg += f"• `{p['nick']}` (+{POINTS_PER_RAID})\n"
+            if len(recognized_players) > 10:
+                report_msg += f"...и еще {len(recognized_players)-10}\n"
+                
+        if unknown_candidates:
+            report_msg += "\n⚠️ **Не найдено в базе (проверьте опечатки):**\n"
+            report_msg += ", ".join([f"`{n}`" for n in unknown_candidates[:5]])
+            if len(unknown_candidates) > 5:
+                report_msg += f"\n...и еще {len(unknown_candidates)-5}"
+                
+        # Сохраняем историю
+        save_event_log("ArcheAge Activity Photo", len(recognized_players), ADMIN_ID, json.dumps({
+            "found": [p['nick'] for p in recognized_players],
+            "misses": unknown_candidates
+        }))
+
+        await msg_status.edit_text(report_msg, parse_mode="Markdown")
+
+    except Exception as e:
+        logger.error(f"Photo processing critical error: {e}")
+        await msg_status.edit_text(f"❌ Критическая ошибка бота: {str(e)}")
+    """Обрабатывает загруженное фото активности"""
+    
+    # 1. Проверка прав
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ Доступ запрещен. Только администратор.")
+        return
+
+    if not OCR_API_KEY:
         await update.message.reply_text("⚠️ Ошибка: API ключ OCR не настроен. Обратитесь к владельцу сервера.")
         return
 
